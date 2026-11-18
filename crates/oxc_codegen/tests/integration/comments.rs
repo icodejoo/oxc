@@ -36,6 +36,21 @@ fn test_line_comment_after_conditional_colon() {
     test_idempotency("x = (_a = a) === null || _a === void 0 ? void 0 : // c1\n// c2\n_a.b();");
 }
 
+// Comments on nested parentheses must stay on one line once the parentheses are dropped;
+// a break would turn the outer comment into a trailing comment of `:` on the next pass.
+// Caught on webpack's `BasicEvaluatedExpression.js`.
+#[test]
+fn test_comments_on_nested_parenthesized_operand() {
+    let source =
+        "x = a ? undefined : /** @type {A} */ (\n\t/** @type {B} */ (expression).range\n);";
+    test(source, "x = a ? undefined : /** @type {A} */ /** @type {B} */ expression.range;\n");
+    test_idempotency(source);
+    // The conditional consequent prints only annotation comments, via a separate paren walk.
+    test_idempotency(
+        "x = a ? /* istanbul ignore next */ (\n\t/* istanbul ignore next */ (expression).range\n) : b;",
+    );
+}
+
 #[test]
 fn test_comments_before_expression_operands() {
     // https://github.com/oxc-project/oxc/issues/21301

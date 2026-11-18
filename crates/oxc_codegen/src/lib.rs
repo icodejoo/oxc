@@ -138,6 +138,8 @@ pub struct Codegen<'a> {
     need_space_before_identifier: usize,
     need_space_before_dot: usize,
     print_next_indent_as_space: bool,
+    /// Output position after a comment group that ended mid-line.
+    inline_comments_end: usize,
     binary_expr_stack: Stack<BinaryExpressionVisitor<'a>>,
     class_stack: Stack<ClassId>,
     next_class_id: ClassId,
@@ -234,6 +236,7 @@ impl<'a> Codegen<'a> {
             needs_semicolon: false,
             need_space_before_dot: 0,
             print_next_indent_as_space: false,
+            inline_comments_end: 0,
             binary_expr_stack: Stack::with_capacity(12),
             class_stack: Stack::with_capacity(4),
             next_class_id: ClassId::from_usize(0),

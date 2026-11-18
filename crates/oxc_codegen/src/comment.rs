@@ -365,6 +365,14 @@ impl Codegen<'_> {
                 match b {
                     b'\n' => self.print_indent(),
                     b'\t' => { /* noop */ }
+                    // Right after another comment group (the tokens between them were dropped, e.g. parens):
+                    // a line break would leave that comment at a line end,
+                    // where the parser re-attaches it as a trailing comment of the preceding token.
+                    _ if self.code_len() == self.inline_comments_end
+                        || (self.code_len() == self.inline_comments_end + 1 && b == b' ') =>
+                    {
+                        self.consume_pending_indent_space();
+                    }
                     _ => {
                         self.print_hard_newline();
                         self.print_indent();
@@ -408,11 +416,13 @@ impl Codegen<'_> {
                 self.print_hard_newline();
             } else {
                 self.print_next_indent_as_space = true;
+                self.inline_comments_end = self.code_len();
             }
         } else if first.is_line() || first.followed_by_newline() {
             self.print_hard_newline();
         } else {
             self.print_next_indent_as_space = true;
+            self.inline_comments_end = self.code_len();
         }
     }
 
