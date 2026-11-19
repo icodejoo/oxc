@@ -75,8 +75,10 @@ impl ServerFormatterBuilder {
         {
             error!("Failed to setup external services.\n{err}\n");
         }
-        let source_formatter = SourceFormatter::new(num_of_threads)
-            .with_external_services(Some(self.external_services.clone()));
+        let source_formatter = SourceFormatter::new(num_of_threads);
+        #[cfg(feature = "napi")]
+        let source_formatter =
+            source_formatter.with_external_services(Some(self.external_services.clone()));
 
         let (formatter, client_message) = ServerFormatter::new(
             root_path.to_path_buf(),
@@ -314,6 +316,7 @@ impl ServerFormatter {
         root_path: &Path,
         explicit_config_path: Option<&Path>,
         use_nested_config: bool,
+        #[cfg_attr(not(feature = "napi"), expect(unused_variables))]
         js_config_loader: &JsConfigLoaderCb,
     ) -> (FormatterState, Vec<ClientMessage>) {
         let mut client_message = vec![];
@@ -321,6 +324,7 @@ impl ServerFormatter {
             root_path,
             explicit_config_path,
             use_nested_config,
+            #[cfg(feature = "napi")]
             Some(js_config_loader),
         ) {
             Ok(scopes) => scopes,
@@ -335,6 +339,7 @@ impl ServerFormatter {
                 ConfigScopes::with_default_root(
                     root_path,
                     use_nested_config,
+                    #[cfg(feature = "napi")]
                     Some(js_config_loader),
                 )
             }

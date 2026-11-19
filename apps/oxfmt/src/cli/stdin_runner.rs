@@ -15,6 +15,8 @@ use crate::core::{
 pub struct StdinRunner {
     options: FormatCommand,
     cwd: PathBuf,
+    /// Only read when JS/TS config files can be loaded (`napi` build).
+    #[cfg_attr(not(feature = "napi"), expect(dead_code))]
     js_config_loader: JsConfigLoaderCb,
     external_services: ExternalServices,
 }
@@ -60,6 +62,7 @@ impl StdinRunner {
             &cwd,
             config_options.config.as_deref(),
             config_options.use_nested_configs(),
+            #[cfg(feature = "napi")]
             Some(&self.js_config_loader),
         ) {
             Ok(scopes) => scopes,
@@ -129,8 +132,9 @@ impl StdinRunner {
             }
         };
 
-        let source_formatter = SourceFormatter::new(num_of_threads)
-            .with_external_services(Some(self.external_services));
+        let source_formatter = SourceFormatter::new(num_of_threads);
+        #[cfg(feature = "napi")]
+        let source_formatter = source_formatter.with_external_services(Some(self.external_services));
 
         // Use `block_in_place()` to avoid nested async runtime access
         match tokio::task::block_in_place(|| source_formatter.format(&source_text, plan)) {
