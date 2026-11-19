@@ -1,0 +1,91 @@
+# 自用：把上游 oxfmt 最新稳定版 + zed/patches 里的补丁（纯 Rust 入口加 --lsp / --stdin-filepath）
+# 构建成 Windows x64 程序，发布到本仓库的 release（预发布，标签 oxfmt_v<上游版本>-zed.<序号>）。
+# 触发：每天定时（上游有新稳定版才构建）、补丁或本文件变动、手动。
+name: zed-oxfmt
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+  push:
+    branches: [zed/oxfmt-pure-lsp]
+    paths: ['zed/**', '.github/workflows/zed-oxfmt.yml']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: zed-oxfmt
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ours
+
+      - name: 查上游最新稳定版
+        id: up
+        run: |
+          tag=$(gh api 'repos/oxc-project/oxc/releases?per_page=100' --jq '[.[] | select((.tag_name | startswith("oxfmt_v")) and (.prerelease | not) and (.draft | not))][0].tag_name')
+          [ -n "$tag" ] || { echo '没查到上游 oxfmt 稳定版'; exit 1; }
+          ver=${tag#oxfmt_v}
+          n=$(gh release list -R "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq "[.[] | select(.tagName | startswith(\"oxfmt_v${ver}-zed.\"))] | length")
+          skip=false
+          if [ "${{ github.event_name }}" = schedule ] && [ "$n" -gt 0 ]; then skip=true; fi
+          echo "upstream=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "release=oxfmt_v${ver}-zed.$((n + 1))" >> "$GITHUB_OUTPUT"
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          echo "上游 $tag，已有 $n 个本仓库构建，skip=$skip"
+
+      - name: 取上游源码并打补丁
+        if: steps.up.outputs.skip != 'true'
+        run: |
+          git clone --depth 1 --branch "${{ steps.up.outputs.upstream }}" https://github.com/oxc-project/oxc.git oxc
+          cd oxc
+          git config user.name ci
+          git config user.email ci@users.noreply.github.com
+          git am --3way ../ours/zed/patches/*.patch
+
+      - name: 装 rust 工具链
+        if: steps.up.outputs.skip != 'true'
+        working-directory: oxc
+        run: |
+          channel=$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)
+          rustup toolchain install "$channel" --profile minimal
+          rustup default "$channel"
+
+      - name: 构建
+        if: steps.up.outputs.skip != 'true'
+        working-directory: oxc
+        run: cargo build --release -p oxfmt --no-default-features
+
+      - name: 冒烟（stdin 与 LSP 入口存在）
+        if: steps.up.outputs.skip != 'true'
+        working-directory: oxc
+        run: |
+          out=$(printf 'const a  = {b:1}\n' | ./target/release/oxfmt.exe --stdin-filepath a.ts)
+          [ "$out" = 'const a = { b: 1 };' ] || { echo "stdin 输出不对：$out"; exit 1; }
+          ./target/release/oxfmt.exe --help | grep -q -- '--lsp'
+
+      - name: 打包并发布
+        if: steps.up.outputs.skip != 'true'
+        run: |
+          mkdir dist
+          cp oxc/target/release/oxfmt.exe dist/
+          cd dist
+          powershell -NoProfile -Command "Compress-Archive -Path oxfmt.exe -DestinationPath oxfmt-x86_64-pc-windows-msvc.zip"
+          sha=$(sha256sum oxfmt-x86_64-pc-windows-msvc.zip | cut -d' ' -f1)
+          gh release create "${{ steps.up.outputs.release }}" oxfmt-x86_64-pc-windows-msvc.zip \
+            -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --latest=false \
+            -t "oxfmt ${{ steps.up.outputs.version }}-zed (Windows x64, pure Rust LSP)" \
+            -n "上游 ${{ steps.up.outputs.upstream }} + zed/patches 补丁，纯 Rust 构建（--no-default-features）。sha256 $sha"
+          echo "发布 ${{ steps.up.outputs.release }}，sha256 $sha"

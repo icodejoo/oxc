@@ -1,0 +1,378 @@
+From 5d1b5264f75a822f238c29117ae0af3babd73a7f Mon Sep 17 00:00:00 2001
+From: jelon <jelon@tbu.net>
+Date: Thu, 19 Nov 2026 10:03:50 +0800
+Subject: [PATCH] feat(oxfmt): pure Rust build supports --lsp and
+ --stdin-filepath
+
+Why: the pure Rust binary already formats JS/TS/CSS/Markdown/YAML/Vue natively, but only the napi entry exposed LSP and stdin, so editors had to start Node.
+
+Both entry points now compile without the napi feature; JS/TS config files and Prettier-only languages (mdx, svelte, astro, ...) stay unsupported there.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ apps/oxfmt/src/cli/command.rs                 | 25 ++++----
+ apps/oxfmt/src/cli/mod.rs                     |  2 -
+ apps/oxfmt/src/cli/stdin_runner.rs            |  8 ++-
+ apps/oxfmt/src/cli/walk_runner.rs             |  2 -
+ apps/oxfmt/src/core/config/scopes.rs          | 10 +++-
+ apps/oxfmt/src/core/external_services_stub.rs | 25 ++++++++
+ apps/oxfmt/src/core/language.rs               |  2 -
+ apps/oxfmt/src/core/mod.rs                    |  9 +++
+ apps/oxfmt/src/lib.rs                         |  3 +-
+ apps/oxfmt/src/lsp/server_formatter.rs        |  9 ++-
+ apps/oxfmt/src/main.rs                        | 58 ++++++++++++++++---
+ 11 files changed, 118 insertions(+), 35 deletions(-)
+ create mode 100644 apps/oxfmt/src/core/external_services_stub.rs
+
+diff --git a/apps/oxfmt/src/cli/command.rs b/apps/oxfmt/src/cli/command.rs
+index 0b33f4b6..807b8231 100644
+--- a/apps/oxfmt/src/cli/command.rs
++++ b/apps/oxfmt/src/cli/command.rs
+@@ -49,10 +49,8 @@ pub enum Mode {
+     /// Default CLI mode run against files and directories
+     Cli(OutputMode),
+     /// Stdin mode - read from stdin and write to stdout
+-    #[cfg(feature = "napi")]
+     Stdin(PathBuf),
+     /// Start language server protocol (LSP) server
+-    #[cfg(feature = "napi")]
+     Lsp,
+     /// Initialize `.oxfmtrc.json` with default values
+     // NOTE: Actual logic is handled by JS side.
+@@ -67,6 +65,16 @@ pub enum Mode {
+ fn mode() -> impl bpaf::Parser<Mode> {
+     let output_mode_options = output_mode().map(Mode::Cli);
+ 
++    let lsp = bpaf::long("lsp")
++        .help("Start language server protocol (LSP) server")
++        .req_flag(Mode::Lsp)
++        .hide_usage();
++    let stdin_filepath = bpaf::long("stdin-filepath")
++        .help("Specify the file name to use to infer which parser to use")
++        .argument::<PathBuf>("PATH")
++        .map(Mode::Stdin)
++        .hide_usage();
++
+     #[cfg(feature = "napi")]
+     {
+         let init = bpaf::long("init")
+@@ -82,15 +90,6 @@ fn mode() -> impl bpaf::Parser<Mode> {
+                 _ => Err(format!("Unknown migration source: {s}. Supported: prettier, biome.")),
+             })
+             .hide_usage();
+-        let lsp = bpaf::long("lsp")
+-            .help("Start language server protocol (LSP) server")
+-            .req_flag(Mode::Lsp)
+-            .hide_usage();
+-        let stdin_filepath = bpaf::long("stdin-filepath")
+-            .help("Specify the file name to use to infer which parser to use")
+-            .argument::<PathBuf>("PATH")
+-            .map(Mode::Stdin)
+-            .hide_usage();
+         let mode_options =
+             bpaf::construct!([init, migrate, lsp, stdin_filepath]).group_help("Mode Options:");
+ 
+@@ -98,7 +97,9 @@ fn mode() -> impl bpaf::Parser<Mode> {
+     }
+     #[cfg(not(feature = "napi"))]
+     {
+-        output_mode_options.fallback(Mode::Cli(OutputMode::Write))
++        let mode_options = bpaf::construct!([lsp, stdin_filepath]).group_help("Mode Options:");
++
++        bpaf::construct!([mode_options, output_mode_options]).fallback(Mode::Cli(OutputMode::Write))
+     }
+ }
+ 
+diff --git a/apps/oxfmt/src/cli/mod.rs b/apps/oxfmt/src/cli/mod.rs
+index 2e35729e..d8f38d38 100644
+--- a/apps/oxfmt/src/cli/mod.rs
++++ b/apps/oxfmt/src/cli/mod.rs
+@@ -3,7 +3,6 @@ mod init;
+ mod reporter;
+ mod result;
+ mod service;
+-#[cfg(feature = "napi")]
+ mod stdin_runner;
+ mod walk;
+ mod walk_runner;
+@@ -14,6 +13,5 @@ pub use command::MigrateSource;
+ pub use command::{FormatCommand, Mode, format_command};
+ pub use init::init_rayon;
+ pub use result::CliRunResult;
+-#[cfg(feature = "napi")]
+ pub use stdin_runner::StdinRunner;
+ pub use walk_runner::WalkRunner;
+diff --git a/apps/oxfmt/src/cli/stdin_runner.rs b/apps/oxfmt/src/cli/stdin_runner.rs
+index 061297eb..777d2f58 100644
+--- a/apps/oxfmt/src/cli/stdin_runner.rs
++++ b/apps/oxfmt/src/cli/stdin_runner.rs
+@@ -15,6 +15,8 @@ use crate::core::{
+ pub struct StdinRunner {
+     options: FormatCommand,
+     cwd: PathBuf,
++    /// Only read when JS/TS config files can be loaded (`napi` build).
++    #[cfg_attr(not(feature = "napi"), expect(dead_code))]
+     js_config_loader: JsConfigLoaderCb,
+     external_services: ExternalServices,
+ }
+@@ -60,6 +62,7 @@ impl StdinRunner {
+             &cwd,
+             config_options.config.as_deref(),
+             config_options.use_nested_configs(),
++            #[cfg(feature = "napi")]
+             Some(&self.js_config_loader),
+         ) {
+             Ok(scopes) => scopes,
+@@ -129,8 +132,9 @@ impl StdinRunner {
+             }
+         };
+ 
+-        let source_formatter = SourceFormatter::new(num_of_threads)
+-            .with_external_services(Some(self.external_services));
++        let source_formatter = SourceFormatter::new(num_of_threads);
++        #[cfg(feature = "napi")]
++        let source_formatter = source_formatter.with_external_services(Some(self.external_services));
+ 
+         // Use `block_in_place()` to avoid nested async runtime access
+         match tokio::task::block_in_place(|| source_formatter.format(&source_text, plan)) {
+diff --git a/apps/oxfmt/src/cli/walk_runner.rs b/apps/oxfmt/src/cli/walk_runner.rs
+index 415b7bff..11082592 100644
+--- a/apps/oxfmt/src/cli/walk_runner.rs
++++ b/apps/oxfmt/src/cli/walk_runner.rs
+@@ -75,8 +75,6 @@ impl WalkRunner {
+         let cwd = self.cwd;
+         let FormatCommand { paths, mode, config_options, ignore_options, runtime_options } =
+             self.options;
+-        // If `napi` feature is disabled, there is no other mode.
+-        #[cfg_attr(not(feature = "napi"), expect(irrefutable_let_patterns))]
+         let Mode::Cli(format_mode) = mode else {
+             unreachable!("`WalkRunner` should only be called with Mode::Cli");
+         };
+diff --git a/apps/oxfmt/src/core/config/scopes.rs b/apps/oxfmt/src/core/config/scopes.rs
+index 700ffa7e..409986ec 100644
+--- a/apps/oxfmt/src/core/config/scopes.rs
++++ b/apps/oxfmt/src/core/config/scopes.rs
+@@ -56,11 +56,10 @@ impl ConfigScopes {
+     /// For LSP, which keeps formatting with defaults when the root config is broken,
+     /// while nested configs are still detected.
+     /// CLI (Walk / Stdin) does not use this and exits with an error instead.
+-    #[cfg(feature = "napi")]
+     pub fn with_default_root(
+         cwd: &Path,
+         use_nested: bool,
+-        js_config_loader: Option<&JsConfigLoaderCb>,
++        #[cfg(feature = "napi")] js_config_loader: Option<&JsConfigLoaderCb>,
+     ) -> Self {
+         let mut root = ConfigResolver::from_json_config(None, None)
+             .expect("Default ConfigResolver should never fail");
+@@ -69,7 +68,12 @@ impl ConfigScopes {
+         // Best effort: an unreadable `.editorconfig` is skipped instead of failing again
+         let editorconfig =
+             load_editorconfig(resolve_editorconfig_path(cwd).as_deref()).ok().flatten();
+-        Self::new(root, ConfigLoader::new(editorconfig, js_config_loader.cloned()), use_nested)
++        let loader = ConfigLoader::new(
++            editorconfig,
++            #[cfg(feature = "napi")]
++            js_config_loader.cloned(),
++        );
++        Self::new(root, loader, use_nested)
+     }
+ 
+     fn new(root: ConfigResolver, loader: ConfigLoader, use_nested: bool) -> Self {
+diff --git a/apps/oxfmt/src/core/external_services_stub.rs b/apps/oxfmt/src/core/external_services_stub.rs
+new file mode 100644
+index 00000000..1233a81f
+--- /dev/null
++++ b/apps/oxfmt/src/core/external_services_stub.rs
+@@ -0,0 +1,25 @@
++//! Stand-in for the napi `ExternalServices` in the pure Rust build.
++//!
++//! There is no JS side here, so nothing needs setting up and nothing is delegated;
++//! it only lets the LSP and Stdin entry points share one code path with the napi build.
++
++/// No-op external services for the pure Rust build.
++#[derive(Clone, Default)]
++pub struct ExternalServices;
++
++impl ExternalServices {
++    /// Nothing to set up without a JS side.
++    ///
++    /// # Errors
++    /// Never fails; the signature matches the napi build.
++    #[expect(clippy::unused_self, clippy::unnecessary_wraps)]
++    pub fn init(&self, _num_of_threads: usize) -> Result<(), String> {
++        Ok(())
++    }
++
++    /// Same constructor name as the napi build's test double.
++    #[cfg(test)]
++    pub fn dummy() -> Self {
++        Self
++    }
++}
+diff --git a/apps/oxfmt/src/core/language.rs b/apps/oxfmt/src/core/language.rs
+index 3f89c972..e24c3870 100644
+--- a/apps/oxfmt/src/core/language.rs
++++ b/apps/oxfmt/src/core/language.rs
+@@ -105,7 +105,6 @@ impl Language {
+ 
+     /// Resolve an LSP `languageId`: VS Code's ids, which match the embedded names except for the React ones.
+     /// `angular` is not a VS Code id, accepted for editors naming Angular templates so (#20242).
+-    #[cfg(feature = "napi")]
+     pub fn from_lsp_id(id: &str) -> Option<Self> {
+         match id {
+             "javascriptreact" => Some(Self::Jsx),
+@@ -116,7 +115,6 @@ impl Language {
+ 
+     /// LSP only: the extension of the fake path for an in-memory document,
+     /// so that config scopes, `ignorePatterns` and `overrides` see it as a file of this language.
+-    #[cfg(feature = "napi")]
+     pub fn to_lsp_extension(self) -> &'static str {
+         match self {
+             Self::Javascript => "js",
+diff --git a/apps/oxfmt/src/core/mod.rs b/apps/oxfmt/src/core/mod.rs
+index 92e4a6d5..49979aae 100644
+--- a/apps/oxfmt/src/core/mod.rs
++++ b/apps/oxfmt/src/core/mod.rs
+@@ -20,6 +20,15 @@ pub use language::Language;
+ #[cfg(feature = "napi")]
+ pub use support::classify_file;
+ 
++/// Stand-in for the napi config loader callback type in the pure Rust build,
++/// where it only travels through the LSP / Stdin entry points and is never called.
++#[cfg(not(feature = "napi"))]
++pub type JsConfigLoaderCb =
++    std::sync::Arc<dyn Fn(String) -> Result<serde_json::Value, String> + Send + Sync>;
++#[cfg(not(feature = "napi"))]
++mod external_services_stub;
++#[cfg(not(feature = "napi"))]
++pub use external_services_stub::ExternalServices;
+ #[cfg(feature = "napi")]
+ pub use external_services::{
+     ExternalServices, JsFormatEmbeddedDocCb, JsFormatFileCb, JsInitExternalServicesCb,
+diff --git a/apps/oxfmt/src/lib.rs b/apps/oxfmt/src/lib.rs
+index 703fc111..af600c0b 100644
+--- a/apps/oxfmt/src/lib.rs
++++ b/apps/oxfmt/src/lib.rs
+@@ -6,7 +6,8 @@ mod core;
+ mod prettier_compat;
+ 
+ pub use core::oxfmtrc;
+-#[cfg(feature = "napi")]
++#[cfg(not(feature = "napi"))]
++pub use core::ExternalServices;
+ pub mod lsp;
+ #[cfg(feature = "napi")]
+ mod main_napi;
+diff --git a/apps/oxfmt/src/lsp/server_formatter.rs b/apps/oxfmt/src/lsp/server_formatter.rs
+index cdd9e8ff..493507e4 100644
+--- a/apps/oxfmt/src/lsp/server_formatter.rs
++++ b/apps/oxfmt/src/lsp/server_formatter.rs
+@@ -75,8 +75,10 @@ impl ServerFormatterBuilder {
+         {
+             error!("Failed to setup external services.\n{err}\n");
+         }
+-        let source_formatter = SourceFormatter::new(num_of_threads)
+-            .with_external_services(Some(self.external_services.clone()));
++        let source_formatter = SourceFormatter::new(num_of_threads);
++        #[cfg(feature = "napi")]
++        let source_formatter =
++            source_formatter.with_external_services(Some(self.external_services.clone()));
+ 
+         let (formatter, client_message) = ServerFormatter::new(
+             root_path.to_path_buf(),
+@@ -314,6 +316,7 @@ impl ServerFormatter {
+         root_path: &Path,
+         explicit_config_path: Option<&Path>,
+         use_nested_config: bool,
++        #[cfg_attr(not(feature = "napi"), expect(unused_variables))]
+         js_config_loader: &JsConfigLoaderCb,
+     ) -> (FormatterState, Vec<ClientMessage>) {
+         let mut client_message = vec![];
+@@ -321,6 +324,7 @@ impl ServerFormatter {
+             root_path,
+             explicit_config_path,
+             use_nested_config,
++            #[cfg(feature = "napi")]
+             Some(js_config_loader),
+         ) {
+             Ok(scopes) => scopes,
+@@ -335,6 +339,7 @@ impl ServerFormatter {
+                 ConfigScopes::with_default_root(
+                     root_path,
+                     use_nested_config,
++                    #[cfg(feature = "napi")]
+                     Some(js_config_loader),
+                 )
+             }
+diff --git a/apps/oxfmt/src/main.rs b/apps/oxfmt/src/main.rs
+index 3d06acfe..74a4c44d 100644
+--- a/apps/oxfmt/src/main.rs
++++ b/apps/oxfmt/src/main.rs
+@@ -1,14 +1,54 @@
+-use oxfmt::cli::{CliRunResult, WalkRunner, format_command, init_rayon, init_tracing};
+-
+ // Pure Rust CLI entry point.
+-// This CLI only supports the basic `Cli` mode.
++// Supports the basic `Cli` mode plus `--lsp` and `--stdin-filepath`,
++// but no Prettier delegation, no JS/TS config files, and no `--init` / `--migrate`.
+ // For full featured JS CLI entry point, see `run_cli()` exported by `main_napi.rs`.
+ 
+-#[tokio::main]
+-async fn main() -> CliRunResult {
+-    let command = format_command().run();
++#[cfg(not(feature = "napi"))]
++mod pure {
++    use std::sync::Arc;
++
++    use oxfmt::{
++        ExternalServices,
++        cli::{
++            CliRunResult, Mode, StdinRunner, WalkRunner, format_command, init_rayon, init_tracing,
++        },
++        lsp::run_lsp,
++    };
++
++    /// JS/TS config files need the Node.js CLI, so the loader always reports that.
++    #[expect(clippy::needless_pass_by_value)]
++    fn unsupported_js_config(path: String) -> Result<serde_json::Value, String> {
++        Err(format!(
++            "JS/TS config file ({path}) is not supported in pure Rust CLI.\nUse JSON/JSONC instead."
++        ))
++    }
++
++    pub async fn run() -> CliRunResult {
++        let command = format_command().run();
+ 
+-    init_tracing();
+-    init_rayon(command.runtime_options.threads);
+-    WalkRunner::new(command).run()
++        init_tracing();
++        match command.mode {
++            Mode::Lsp => {
++                run_lsp(Arc::new(unsupported_js_config), ExternalServices).await;
++                CliRunResult::None
++            }
++            Mode::Stdin(_) => {
++                StdinRunner::new(command, Arc::new(unsupported_js_config), ExternalServices).run()
++            }
++            Mode::Cli(_) => {
++                init_rayon(command.runtime_options.threads);
++                WalkRunner::new(command).run()
++            }
++        }
++    }
+ }
++
++#[cfg(not(feature = "napi"))]
++#[tokio::main]
++async fn main() -> oxfmt::cli::CliRunResult {
++    pure::run().await
++}
++
++// With the `napi` feature the JS entry point is used instead, this binary has nothing to run.
++#[cfg(feature = "napi")]
++fn main() {}
+-- 
+2.54.0.windows.1
+
